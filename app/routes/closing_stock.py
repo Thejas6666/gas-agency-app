@@ -4,14 +4,13 @@ from app.db.session import SessionLocal
 
 closing_stock_bp = Blueprint("closing_stock", __name__)
 
-
 @closing_stock_bp.route("/closing-stock", methods=["GET", "POST"])
 def closing_view():
     db = SessionLocal()
     try:
         # 1. Fetch the current active OPEN stock day
         open_day = db.execute(text("""
-            SELECT stock_day_id, stock_date 
+            SELECT stock_day_id, stock_date, delivery_no_movement 
             FROM stock_days 
             WHERE status = 'OPEN' 
             ORDER BY stock_date DESC LIMIT 1
@@ -23,18 +22,21 @@ def closing_view():
 
         s_id = open_day.stock_day_id
 
-        # 2. PREREQUISITE CHECK: Ensure Step 3 (Delivery Issues) has entries
-        step3_done = db.execute(text("""
+        # 2. PREREQUISITE CHECK:
+        # Step 3 is done if: (Audit rows exist) OR (No Movement flag is enabled)
+        has_delivery_rows = db.execute(text("""
             SELECT COUNT(*) FROM delivery_issues WHERE stock_day_id = :s_id
         """), {"s_id": s_id}).scalar() > 0
 
-        # 3. MASTER LOCK CHECK: Fixed logic for 0 vs NULL
-        # Summing sales_regular. If it's 0, the user hasn't finalized Step 4 yet.
+        step3_done = has_delivery_rows or (open_day.delivery_no_movement == 1)
+
+        # 3. MASTER LOCK CHECK:
+        # Using the new is_reconciled flag instead of SUM(sales)
         is_finalized = db.execute(text("""
-            SELECT COALESCE(SUM(sales_regular), 0) 
+            SELECT MAX(is_reconciled) 
             FROM daily_stock_summary 
             WHERE stock_day_id = :s_id
-        """), {"s_id": s_id}).scalar() > 0
+        """), {"s_id": s_id}).scalar() == 1
 
         # 4. Fetch Data for Reconciliation Math
         summary_raw = db.execute(text("""
@@ -91,7 +93,7 @@ def closing_view():
                 return redirect(url_for("closing_stock.closing_view"))
 
             if not step3_done:
-                flash("Error: Cannot finalize. Please complete Step 3 (Deliveries) first.", "danger")
+                flash("Error: Please complete Step 3 before finalizing.", "danger")
                 return redirect(url_for("closing_stock.closing_view"))
 
             for item in display_data:
@@ -103,7 +105,8 @@ def closing_view():
                         sales_regular = :sr, 
                         nc_qty = :nq, 
                         dbc_qty = :dq, 
-                        tv_out_qty = :tvq
+                        tv_out_qty = :tvq,
+                        is_reconciled = 1
                     WHERE stock_day_id = :s_id AND cylinder_type_id = :ct_id
                 """), {
                     "cf": item['closing']['f'],
@@ -118,7 +121,7 @@ def closing_view():
                 })
 
             db.commit()
-            flash(f"Reconciliation successful. Stock updated for {open_day.stock_date}.", "success")
+            flash(f"Reconciliation successful. Stock locked for {open_day.stock_date}.", "success")
             return redirect(url_for("closing_stock.closing_view"))
 
         return render_template("closing_stock.html",

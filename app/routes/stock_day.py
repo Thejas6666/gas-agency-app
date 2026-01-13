@@ -15,7 +15,7 @@ def dashboard():
     try:
         # 1. Fetch the most recent day (OPEN or CLOSED)
         day = db.execute(text("""
-            SELECT stock_day_id, stock_date, status 
+            SELECT stock_day_id, stock_date, status, delivery_no_movement 
             FROM stock_days 
             ORDER BY stock_date DESC 
             LIMIT 1
@@ -33,9 +33,13 @@ def dashboard():
 
         # Initialize progress flags (Sequential Logic)
         progress = {
-            "opening_stock": False, "iocl_movements": False, "deliveries": False,
-            "finalized_stock": False, "expected_cash": False,
-            "cash_collection": False, "reconciled_cash": False
+            "opening_stock": False,
+            "iocl_movements": False,
+            "deliveries": False,
+            "finalized_stock": False,
+            "expected_cash": False,
+            "cash_collection": False,
+            "reconciled_cash": False
         }
 
         if day and not is_day_closed:
@@ -47,8 +51,8 @@ def dashboard():
                 WHERE stock_day_id = :s_id AND opening_filled IS NOT NULL
             """), {"s_id": s_id}).scalar() > 0
 
-            # Step 2: IOCL Movements (UPDATED LOGIC)
-            # A day is complete if: (Total Receipt + Return > 0) OR (No Movement flag is set)
+            # Step 2: IOCL Movements
+            # Done if receipts exist OR "No Movement" toggle was saved
             iocl_status = db.execute(text("""
                 SELECT 
                     (COALESCE(SUM(item_receipt + item_return), 0) > 0) OR 
@@ -57,22 +61,27 @@ def dashboard():
                 WHERE stock_day_id = :s_id
             """), {"s_id": s_id}).fetchone()
 
-            # Step 2 depends on its own data AND Step 1 completion
-            progress["iocl_movements"] = bool(iocl_status[0]) if iocl_status else False
-            progress["iocl_movements"] = progress["iocl_movements"] and progress["opening_stock"]
+            has_iocl_logic = bool(iocl_status[0]) if iocl_status else False
+            progress["iocl_movements"] = has_iocl_logic and progress["opening_stock"]
 
             # Step 3: Delivery Issues
-            # Now unlocks correctly if Step 2 was marked as "No Movement"
-            has_delivery = db.execute(text("""
+            # Done if rows exist in delivery_issues OR "delivery_no_movement" flag is set in stock_days
+            has_delivery_data = db.execute(text("""
                 SELECT COUNT(*) FROM delivery_issues WHERE stock_day_id = :s_id
             """), {"s_id": s_id}).scalar() > 0
-            progress["deliveries"] = has_delivery and progress["iocl_movements"]
 
-            # Step 4: Reconciliation
+            no_delivery_movement = (day.delivery_no_movement == 1)
+            progress["deliveries"] = (has_delivery_data or no_delivery_movement) and progress["iocl_movements"]
+
+            # Step 4: Reconciliation (Closing Stock)
+            # FIXED: We now check the explicit 'is_reconciled' flag.
+            # This allows the step to be "Completed" even if sales_regular is 0.
             has_finalized = db.execute(text("""
-                SELECT COALESCE(SUM(sales_regular), 0) FROM daily_stock_summary 
+                SELECT MAX(is_reconciled) 
+                FROM daily_stock_summary 
                 WHERE stock_day_id = :s_id
-            """), {"s_id": s_id}).scalar() > 0
+            """), {"s_id": s_id}).scalar() == 1
+
             progress["finalized_stock"] = has_finalized and progress["deliveries"]
 
             # Steps 5, 6, 7 (Cash Handling)
@@ -119,13 +128,9 @@ def generate_report():
             record.stock_date)
 
         if report_type == 'stock':
-            return redirect(url_for('cash_reconciliation.download_stock',
-                                    day_id=record.stock_day_id,
-                                    date=date_str))
+            return redirect(url_for('cash_reconciliation.download_stock', day_id=record.stock_day_id, date=date_str))
         else:
-            return redirect(url_for('cash_reconciliation.download_cash',
-                                    day_id=record.stock_day_id,
-                                    date=date_str))
+            return redirect(url_for('cash_reconciliation.download_cash', day_id=record.stock_day_id, date=date_str))
     finally:
         db.close()
 
@@ -153,7 +158,10 @@ def create_new_day():
                 flash(f"Error: Date {selected_date} already exists!", "danger")
                 return redirect(url_for('stock_day.create_new_day'))
 
-            db.execute(text("INSERT INTO stock_days (stock_date, status) VALUES (:sd, 'OPEN')"), {"sd": selected_date})
+            # Initialize new day with no_movement flag as 0
+            db.execute(
+                text("INSERT INTO stock_days (stock_date, status, delivery_no_movement) VALUES (:sd, 'OPEN', 0)"),
+                {"sd": selected_date})
             db.commit()
             return redirect(url_for('stock_day.dashboard'))
 

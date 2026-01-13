@@ -23,22 +23,22 @@ def iocl_view():
 
         s_id = open_day.stock_day_id
 
-        # 2. Check if "No Movement" flag is set for this day
+        # 2. MASTER LOCK CHECK: Check the explicit is_reconciled flag
+        is_finalized = db.execute(text("""
+            SELECT COALESCE(MAX(is_reconciled), 0) FROM daily_stock_summary 
+            WHERE stock_day_id = :s_id
+        """), {"s_id": s_id}).scalar() == 1
+
+        # 3. Check if "No Movement" flag is set for Step 2
         current_no_mov = db.execute(text("""
-            SELECT MAX(iocl_no_movement) FROM daily_stock_summary 
+            SELECT COALESCE(MAX(iocl_no_movement), 0) FROM daily_stock_summary 
             WHERE stock_day_id = :s_id
         """), {"s_id": s_id}).scalar() or 0
 
-        # 3. Step 1 Prerequisite Check
+        # 4. Step 1 Prerequisite Check
         step1_done = db.execute(text("""
             SELECT COUNT(*) FROM daily_stock_summary 
             WHERE stock_day_id = :s_id AND opening_filled IS NOT NULL
-        """), {"s_id": s_id}).scalar() > 0
-
-        # 4. Master Lock Check (Step 4 check)
-        is_finalized = db.execute(text("""
-            SELECT COALESCE(SUM(sales_regular), 0) FROM daily_stock_summary 
-            WHERE stock_day_id = :s_id
         """), {"s_id": s_id}).scalar() > 0
 
         is_editable = step1_done and not is_finalized
@@ -46,20 +46,18 @@ def iocl_view():
         # 5. Handle Form Submission
         if request.method == "POST":
             if not is_editable:
-                flash("Entry Locked: Prerequisite missing or day finalized.", "danger")
+                flash("Entry Locked: This day has been finalized in Step 4.", "danger")
                 return redirect(url_for("iocl_movements.iocl_view"))
 
             no_mov_checked = 1 if request.form.get("no_movement") else 0
 
             if no_mov_checked == 1:
-                # Set flag and clear values
                 db.execute(text("""
                     UPDATE daily_stock_summary 
                     SET item_receipt = 0, item_return = 0, iocl_no_movement = 1
                     WHERE stock_day_id = :s_id
                 """), {"s_id": s_id})
             else:
-                # Update specific counts and clear flag
                 for key, value in request.form.items():
                     if key.startswith("receipt_"):
                         c_id = key.split("_")[1]
@@ -91,19 +89,13 @@ def iocl_view():
 
         total_received = sum(row.item_receipt for row in rows)
         total_returned = sum(row.item_return for row in rows)
-
-        # Step 2 is complete if numbers exist OR No Movement flag is on
         has_data = (total_received + total_returned) > 0 or current_no_mov == 1
 
         return render_template("iocl_movements.html",
-                               rows=rows,
-                               stock_date=open_day.stock_date,
-                               no_movement=current_no_mov,
-                               has_data=has_data,
-                               is_editable=is_editable,
-                               step1_done=step1_done,
-                               is_finalized=is_finalized,
-                               total_received=total_received,
+                               rows=rows, stock_date=open_day.stock_date,
+                               no_movement=current_no_mov, has_data=has_data,
+                               is_editable=is_editable, step1_done=step1_done,
+                               is_finalized=is_finalized, total_received=total_received,
                                total_returned=total_returned)
     finally:
         db.close()
@@ -116,6 +108,17 @@ def delete_movements():
         open_day = db.execute(text("SELECT stock_day_id FROM stock_days WHERE status = 'OPEN' LIMIT 1")).fetchone()
         if open_day:
             s_id = open_day.stock_day_id
+
+            # Master Lock Check
+            is_finalized = db.execute(text("""
+                SELECT COALESCE(MAX(is_reconciled), 0) FROM daily_stock_summary 
+                WHERE stock_day_id = :s_id
+            """), {"s_id": s_id}).scalar() == 1
+
+            if is_finalized:
+                flash("Locked: Cannot reset finalized records.", "danger")
+                return redirect(url_for("iocl_movements.iocl_view"))
+
             db.execute(text("""
                 UPDATE daily_stock_summary 
                 SET item_receipt = 0, item_return = 0, iocl_no_movement = 0
